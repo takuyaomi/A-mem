@@ -236,7 +236,23 @@ class AgenticMemorySystem:
         if time is not None:
             kwargs['timestamp'] = time
         note = MemoryNote(content=content, **kwargs)
-        
+
+        # Populate keywords/context/tags via LLM analysis if not already provided
+        if not note.keywords and not kwargs.get('keywords'):
+            try:
+                analysis = self.analyze_content(content)
+                if analysis.get("keywords") and not note.keywords:
+                    note.keywords = analysis["keywords"]
+                if analysis.get("context") and note.context in ("General", "", None):
+                    note.context = analysis["context"]
+                if analysis.get("tags") and not note.tags:
+                    existing = set(note.tags)
+                    for tag in analysis["tags"]:
+                        if tag not in existing:
+                            note.tags.append(tag)
+            except Exception as e:
+                logger.warning("analyze_content failed, proceeding without enrichment: %s", e)
+
         # Update retriever with all documents
         evo_label, note = self.process_memory(note)
         self.memories[note.id] = note
@@ -556,7 +572,7 @@ class AgenticMemorySystem:
             for memory in list(memories):  # Use a copy to avoid modification during iteration
                 if neighbor_count >= k:
                     break
-                    
+
                 # Get links from metadata
                 links = memory.get('links', [])
                 if not links and 'id' in memory:
@@ -564,9 +580,9 @@ class AgenticMemorySystem:
                     mem_obj = self.memories.get(memory['id'])
                     if mem_obj:
                         links = mem_obj.links
-                        
+
                 for link_id in links:
-                    if link_id not in seen_ids and neighbor_count < k:
+                    if link_id not in seen_ids and link_id != memory.get('id') and neighbor_count < k:
                         neighbor = self.memories.get(link_id)
                         if neighbor:
                             memories.append({
@@ -581,11 +597,71 @@ class AgenticMemorySystem:
                             })
                             seen_ids.add(link_id)
                             neighbor_count += 1
-            
+
+            # Increment retrieval_count and persist to ChromaDB
+            current_time = datetime.now().strftime("%Y%m%d%H%M")
+            for mem_dict in memories:
+                mem_id = mem_dict.get('id')
+                if mem_id and mem_id in self.memories:
+                    note = self.memories[mem_id]
+                    note.retrieval_count = (note.retrieval_count or 0) + 1
+                    note.last_accessed = current_time
+                    try:
+                        updated_metadata = {
+                            "id": note.id,
+                            "content": note.content,
+                            "keywords": note.keywords,
+                            "links": note.links,
+                            "retrieval_count": note.retrieval_count,
+                            "timestamp": note.timestamp,
+                            "last_accessed": note.last_accessed,
+                            "context": note.context,
+                            "evolution_history": note.evolution_history,
+                            "category": note.category,
+                            "tags": note.tags,
+                        }
+                        self.retriever.delete_document(mem_id)
+                        self.retriever.add_document(note.content, updated_metadata, mem_id)
+                    except Exception as e:
+                        logger.warning("Failed to update retrieval_count in ChromaDB for %s: %s", mem_id, e)
+
             return memories[:k]
         except Exception as e:
             logger.error(f"Error in search_agentic: {str(e)}")
             return []
+
+    def _resolve_link_reference(
+        self,
+        reference: str,
+        notes_id_list: list,
+        search_indices: list,
+    ) -> Optional[str]:
+        """Resolve a link reference from LLM output to an actual memory UUID.
+
+        The LLM may return references in various formats:
+          - "0", "1" (plain index)
+          - "memory index:0", "memory_index:0" (prefixed index)
+          - An actual UUID string
+
+        Returns the resolved UUID or None if unresolvable.
+        """
+        import re
+        # Case 1: Already a valid UUID in our memories
+        if reference in self.memories:
+            return reference
+        # Case 2: Extract numeric index from various formats
+        match = re.search(r'(\d+)', reference.strip())
+        if match:
+            idx = int(match.group(1))
+            # The index refers to the position in the search results
+            if idx < len(search_indices):
+                real_idx = search_indices[idx]
+                if real_idx < len(notes_id_list):
+                    return notes_id_list[real_idx]
+            # Fallback: treat as direct index into notes_id_list
+            if idx < len(notes_id_list):
+                return notes_id_list[idx]
+        return None
 
     def process_memory(self, note: MemoryNote) -> Tuple[bool, MemoryNote]:
         """Process a memory note and determine if it should evolve.
@@ -679,7 +755,15 @@ class AgenticMemorySystem:
                         if action == "strengthen":
                             suggest_connections = response_json["suggested_connections"]
                             new_tags = response_json["tags_to_update"]
-                            note.links.extend(suggest_connections)
+                            # Resolve index-based references to actual memory UUIDs
+                            notes_id_list = list(self.memories.keys())
+                            resolved_links = []
+                            for conn in suggest_connections:
+                                resolved = self._resolve_link_reference(conn, notes_id_list, indices)
+                                if resolved and resolved != note.id:  # Prevent self-loops
+                                    resolved_links.append(resolved)
+                            note.links.extend(resolved_links)
+                            note.links = list(dict.fromkeys(note.links))  # Deduplicate
                             note.tags = new_tags
                         elif action == "update_neighbor":
                             new_context_neighborhood = response_json["new_context_neighborhood"]
