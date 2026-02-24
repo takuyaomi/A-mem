@@ -90,23 +90,26 @@ class AgenticMemorySystem:
     - Hybrid search capabilities
     """
     
-    def __init__(self, 
+    def __init__(self,
                  model_name: str = 'all-MiniLM-L6-v2',
                  llm_backend: str = "openai",
                  llm_model: str = "gpt-4o-mini",
                  evo_threshold: int = 100,
-                 api_key: Optional[str] = None):  
+                 api_key: Optional[str] = None,
+                 evolution_k: int = 5):
         """Initialize the memory system.
-        
+
         Args:
             model_name: Name of the sentence transformer model
             llm_backend: LLM backend to use (openai/ollama)
             llm_model: Name of the LLM model
             evo_threshold: Number of memories before triggering evolution
             api_key: API key for the LLM service
+            evolution_k: Number of nearest neighbors for link generation and evolution (paper default: 5)
         """
         self.memories = {}
         self.model_name = model_name
+        self.evolution_k = evolution_k
         # Initialize ChromaDB retriever with empty collection
         try:
             # First try to reset the collection if it exists
@@ -123,38 +126,67 @@ class AgenticMemorySystem:
         self.evo_cnt = 0
         self.evo_threshold = evo_threshold
 
-        # Evolution system prompt
-        self._evolution_system_prompt = '''
-                                You are an AI memory evolution agent responsible for managing and evolving a knowledge base.
-                                Analyze the the new memory note according to keywords and context, also with their several nearest neighbors memory.
-                                Make decisions about its evolution.  
+        # Ps2: Link generation prompt (paper Section 3.2, Eq.6)
+        self._link_generation_prompt = """You are an AI memory linking agent.
+Analyze the new memory and its nearest neighbors to determine
+which memories should be linked based on shared semantic relationships.
 
-                                The new memory context:
-                                {context}
-                                content: {content}
-                                keywords: {keywords}
+New memory:
+  content: {content}
+  context: {context}
+  keywords: {keywords}
 
-                                The nearest neighbors memories:
-                                {nearest_neighbors_memories}
+Nearest neighbor memories:
+{nearest_neighbors_memories}
 
-                                Based on this information, determine:
-                                1. Should this memory be evolved? Consider its relationships with other memories.
-                                2. What specific actions should be taken (strengthen, update_neighbor)?
-                                   2.1 If choose to strengthen the connection, which memory should it be connected to? Can you give the updated tags of this memory?
-                                   2.2 If choose to update_neighbor, you can update the context and tags of these memories based on the understanding of these memories. If the context and the tags are not updated, the new context and tags should be the same as the original ones. Generate the new context and tags in the sequential order of the input neighbors.
-                                Tags should be determined by the content of these characteristic of these memories, which can be used to retrieve them later and categorize them.
-                                Note that the length of new_tags_neighborhood must equal the number of input neighbors, and the length of new_context_neighborhood must equal the number of input neighbors.
-                                The number of neighbors is {neighbor_number}.
-                                Return your decision in JSON format with the following structure:
-                                {{
-                                    "should_evolve": True or False,
-                                    "actions": ["strengthen", "update_neighbor"],
-                                    "suggested_connections": ["neighbor_memory_ids"],
-                                    "tags_to_update": ["tag_1",..."tag_n"], 
-                                    "new_context_neighborhood": ["new context",...,"new context"],
-                                    "new_tags_neighborhood": [["tag_1",...,"tag_n"],...["tag_1",...,"tag_n"]],
-                                }}
-                                '''
+Determine which neighbor memories share meaningful semantic connections
+with the new memory. Consider:
+- Common themes or topics
+- Causal relationships
+- Complementary information
+- Shared conceptual frameworks
+
+Return JSON:
+{{
+  "should_link": true or false,
+  "connections": ["neighbor_memory_id_or_index"],
+  "link_reasons": ["reason for each connection"]
+}}
+"""
+
+        # Ps3: Memory evolution prompt (paper Section 3.3, Eq.7)
+        # Called individually for each neighbor memory.
+        self._evolution_prompt = """You are an AI memory evolution agent.
+Given a new memory and a specific existing memory, determine
+if the existing memory should be updated based on the new information.
+
+New memory:
+  content: {new_content}
+  context: {new_context}
+  keywords: {new_keywords}
+
+Other context memories:
+{other_neighbors}
+
+Memory to evaluate for evolution:
+  id: {target_id}
+  content: {target_content}
+  context: {target_context}
+  keywords: {target_keywords}
+  tags: {target_tags}
+
+Should this memory's metadata be updated to reflect
+the relationship with the new memory? Only evolve if there is
+a meaningful semantic connection that warrants updating the metadata.
+
+Return JSON:
+{{
+  "should_evolve": true or false,
+  "new_context": "updated context description",
+  "new_tags": ["updated", "tags"],
+  "new_keywords": ["updated", "keywords"]
+}}
+"""
         
     def analyze_content(self, content: str) -> Dict:            
         """Analyze content using LLM to extract semantic metadata.
@@ -301,32 +333,44 @@ class AgenticMemorySystem:
             }
             self.retriever.add_document(memory.content, metadata, memory.id)
     
-    def find_related_memories(self, query: str, k: int = 5) -> Tuple[str, List[int]]:
-        """Find related memories using ChromaDB retrieval"""
+    def find_related_memories(self, query: str, k: int = 5) -> Tuple[str, List[int], List[str]]:
+        """Find related memories using ChromaDB retrieval.
+
+        Returns:
+            Tuple of (formatted_text, indices, neighbor_ids)
+            - formatted_text: human-readable string of neighbor memories
+            - indices: position indices (0, 1, 2, ...)
+            - neighbor_ids: actual ChromaDB document IDs for each result
+        """
         if not self.memories:
-            return "", []
-            
+            return "", [], []
+
         try:
-            # Get results from ChromaDB
             results = self.retriever.search(query, k)
-            
-            # Convert to list of memories
+
             memory_str = ""
             indices = []
-            
+            neighbor_ids = []
+
             if 'ids' in results and results['ids'] and len(results['ids']) > 0 and len(results['ids'][0]) > 0:
                 for i, doc_id in enumerate(results['ids'][0]):
-                    # Get metadata from ChromaDB results
                     if i < len(results['metadatas'][0]):
                         metadata = results['metadatas'][0][i]
-                        # Format memory string
-                        memory_str += f"memory index:{i}\ttalk start time:{metadata.get('timestamp', '')}\tmemory content: {metadata.get('content', '')}\tmemory context: {metadata.get('context', '')}\tmemory keywords: {str(metadata.get('keywords', []))}\tmemory tags: {str(metadata.get('tags', []))}\n"
+                        memory_str += (
+                            f"memory index:{i}\tid:{doc_id}\t"
+                            f"talk start time:{metadata.get('timestamp', '')}\t"
+                            f"memory content: {metadata.get('content', '')}\t"
+                            f"memory context: {metadata.get('context', '')}\t"
+                            f"memory keywords: {str(metadata.get('keywords', []))}\t"
+                            f"memory tags: {str(metadata.get('tags', []))}\n"
+                        )
                         indices.append(i)
-                    
-            return memory_str, indices
+                        neighbor_ids.append(doc_id)
+
+            return memory_str, indices, neighbor_ids
         except Exception as e:
             logger.error(f"Error in find_related_memories: {str(e)}")
-            return "", []
+            return "", [], []
 
     def find_related_memories_raw(self, query: str, k: int = 5) -> str:
         """Find related memories using ChromaDB retrieval in raw format"""
@@ -663,149 +707,227 @@ class AgenticMemorySystem:
                 return notes_id_list[idx]
         return None
 
-    def process_memory(self, note: MemoryNote) -> Tuple[bool, MemoryNote]:
-        """Process a memory note and determine if it should evolve.
-        
-        Args:
-            note: The memory note to process
-            
-        Returns:
-            Tuple[bool, MemoryNote]: (should_evolve, processed_note)
-        """
-        # For first memory or testing, just return the note without evolution
-        if not self.memories:
-            return False, note
-            
+    def _format_neighbors_for_prompt(self, neighbor_ids: List[str]) -> str:
+        """Format a list of neighbor memory IDs into a text block for LLM prompts."""
+        text = ""
+        for i, nid in enumerate(neighbor_ids):
+            note = self.memories.get(nid)
+            if note:
+                text += (
+                    f"memory index:{i}\tid:{nid}\t"
+                    f"content: {note.content}\t"
+                    f"context: {note.context}\t"
+                    f"keywords: {note.keywords}\t"
+                    f"tags: {note.tags}\n"
+                )
+        return text or "(none)"
+
+    def _persist_memory_to_chroma(self, note: MemoryNote):
+        """Persist the current state of a memory note to ChromaDB."""
+        metadata = {
+            "id": note.id,
+            "content": note.content,
+            "keywords": note.keywords,
+            "links": note.links,
+            "retrieval_count": note.retrieval_count,
+            "timestamp": note.timestamp,
+            "last_accessed": note.last_accessed,
+            "context": note.context,
+            "evolution_history": note.evolution_history,
+            "category": note.category,
+            "tags": note.tags,
+        }
         try:
-            # Get nearest neighbors
-            neighbors_text, indices = self.find_related_memories(note.content, k=5)
-            if not neighbors_text or not indices:
-                return False, note
-                
-            # Format neighbors for LLM - in this case, neighbors_text is already formatted
-            
-            # Query LLM for evolution decision
-            prompt = self._evolution_system_prompt.format(
-                content=note.content,
-                context=note.context,
-                keywords=note.keywords,
-                nearest_neighbors_memories=neighbors_text,
-                neighbor_number=len(indices)
+            self.retriever.delete_document(note.id)
+        except Exception:
+            pass
+        self.retriever.add_document(note.content, metadata, note.id)
+
+    def _generate_links(self, note: MemoryNote, neighbors_text: str, neighbor_ids: List[str]) -> bool:
+        """Phase 1 (Ps2): Link generation between new memory and its neighbors.
+
+        Determines which neighbor memories should be linked to the new memory
+        based on shared semantic relationships. Creates bidirectional links.
+
+        Returns True if any links were created.
+        """
+        prompt = self._link_generation_prompt.format(
+            content=note.content,
+            context=note.context,
+            keywords=note.keywords,
+            nearest_neighbors_memories=neighbors_text,
+        )
+
+        try:
+            response = self.llm_controller.llm.get_completion(
+                prompt,
+                response_format={"type": "json_schema", "json_schema": {
+                    "name": "link_response",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "should_link": {"type": "boolean"},
+                            "connections": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            },
+                            "link_reasons": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            },
+                        },
+                        "required": ["should_link", "connections", "link_reasons"],
+                        "additionalProperties": False,
+                    },
+                    "strict": True,
+                }},
             )
-            
+            response_json = json.loads(response)
+
+            if not response_json.get("should_link", False):
+                return False
+
+            connections = response_json.get("connections", [])
+            notes_id_list = list(self.memories.keys())
+            indices = list(range(len(neighbor_ids)))
+
+            resolved = []
+            for conn in connections:
+                r = self._resolve_link_reference(conn, neighbor_ids, indices)
+                if r and r != note.id:
+                    resolved.append(r)
+
+            if not resolved:
+                return False
+
+            # Bidirectional linking
+            for linked_id in resolved:
+                # Forward: note -> linked
+                if linked_id not in note.links:
+                    note.links.append(linked_id)
+                # Reverse: linked -> note
+                linked_note = self.memories.get(linked_id)
+                if linked_note and note.id not in linked_note.links:
+                    linked_note.links.append(note.id)
+                    self._persist_memory_to_chroma(linked_note)
+
+            note.links = list(dict.fromkeys(note.links))  # deduplicate
+            logger.info(
+                "Link generation: note %s linked to %s",
+                note.id, resolved,
+            )
+            return True
+
+        except (json.JSONDecodeError, KeyError, Exception) as e:
+            logger.error("Error in link generation: %s", e)
+            return False
+
+    def _evolve_neighbors(self, note: MemoryNote, neighbor_ids: List[str]):
+        """Phase 2 (Ps3): Per-neighbor memory evolution.
+
+        For each neighbor, individually query the LLM to decide whether
+        the neighbor should be updated given the new memory.
+        Paper: Eq.7 -- each m_j is evaluated separately.
+        """
+        for target_id in neighbor_ids:
+            target = self.memories.get(target_id)
+            if not target:
+                continue
+
+            # Other neighbors (excluding target) as context
+            other_ids = [nid for nid in neighbor_ids if nid != target_id]
+            other_text = self._format_neighbors_for_prompt(other_ids)
+
+            prompt = self._evolution_prompt.format(
+                new_content=note.content,
+                new_context=note.context,
+                new_keywords=note.keywords,
+                other_neighbors=other_text,
+                target_id=target_id,
+                target_content=target.content,
+                target_context=target.context,
+                target_keywords=target.keywords,
+                target_tags=target.tags,
+            )
+
             try:
                 response = self.llm_controller.llm.get_completion(
                     prompt,
                     response_format={"type": "json_schema", "json_schema": {
-                        "name": "response",
+                        "name": "evolution_response",
                         "schema": {
                             "type": "object",
                             "properties": {
-                                "should_evolve": {
-                                    "type": "boolean"
-                                },
-                                "actions": {
+                                "should_evolve": {"type": "boolean"},
+                                "new_context": {"type": "string"},
+                                "new_tags": {
                                     "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
+                                    "items": {"type": "string"},
                                 },
-                                "suggested_connections": {
+                                "new_keywords": {
                                     "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
+                                    "items": {"type": "string"},
                                 },
-                                "new_context_neighborhood": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                },
-                                "tags_to_update": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "string"
-                                    }
-                                },
-                                "new_tags_neighborhood": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "string"
-                                        }
-                                    }
-                                }
                             },
-                            "required": ["should_evolve", "actions", "suggested_connections", 
-                                      "tags_to_update", "new_context_neighborhood", "new_tags_neighborhood"],
-                            "additionalProperties": False
+                            "required": ["should_evolve", "new_context", "new_tags", "new_keywords"],
+                            "additionalProperties": False,
                         },
-                        "strict": True
-                    }}
+                        "strict": True,
+                    }},
                 )
-                
                 response_json = json.loads(response)
-                should_evolve = response_json["should_evolve"]
-                
-                if should_evolve:
-                    actions = response_json["actions"]
-                    for action in actions:
-                        if action == "strengthen":
-                            suggest_connections = response_json["suggested_connections"]
-                            new_tags = response_json["tags_to_update"]
-                            # Resolve index-based references to actual memory UUIDs
-                            notes_id_list = list(self.memories.keys())
-                            resolved_links = []
-                            for conn in suggest_connections:
-                                resolved = self._resolve_link_reference(conn, notes_id_list, indices)
-                                if resolved and resolved != note.id:  # Prevent self-loops
-                                    resolved_links.append(resolved)
-                            note.links.extend(resolved_links)
-                            note.links = list(dict.fromkeys(note.links))  # Deduplicate
-                            note.tags = new_tags
-                        elif action == "update_neighbor":
-                            new_context_neighborhood = response_json["new_context_neighborhood"]
-                            new_tags_neighborhood = response_json["new_tags_neighborhood"]
-                            noteslist = list(self.memories.values())
-                            notes_id = list(self.memories.keys())
-                            
-                            for i in range(min(len(indices), len(new_tags_neighborhood))):
-                                # Skip if we don't have enough neighbors
-                                if i >= len(indices):
-                                    continue
-                                    
-                                tag = new_tags_neighborhood[i]
-                                if i < len(new_context_neighborhood):
-                                    context = new_context_neighborhood[i]
-                                else:
-                                    # Since indices are just numbers now, we need to find the memory
-                                    # In memory list using its index number
-                                    if i < len(noteslist):
-                                        context = noteslist[i].context
-                                    else:
-                                        continue
-                                        
-                                # Get index from the indices list
-                                if i < len(indices):
-                                    memorytmp_idx = indices[i]
-                                    # Make sure the index is valid
-                                    if memorytmp_idx < len(noteslist):
-                                        notetmp = noteslist[memorytmp_idx]
-                                        notetmp.tags = tag
-                                        notetmp.context = context
-                                        # Make sure the index is valid
-                                        if memorytmp_idx < len(notes_id):
-                                            self.memories[notes_id[memorytmp_idx]] = notetmp
-                                
-                return should_evolve, note
-                
+
+                if response_json.get("should_evolve", False):
+                    target.context = response_json["new_context"]
+                    target.tags = response_json["new_tags"]
+                    target.keywords = response_json.get("new_keywords", target.keywords)
+                    target.evolution_history.append({
+                        "timestamp": datetime.now().strftime("%Y%m%d%H%M"),
+                        "trigger": note.id,
+                        "action": "evolution",
+                    })
+                    self.memories[target_id] = target
+                    self._persist_memory_to_chroma(target)
+                    logger.info(
+                        "Evolution: neighbor %s evolved (trigger=%s)",
+                        target_id, note.id,
+                    )
+
             except (json.JSONDecodeError, KeyError, Exception) as e:
-                logger.error(f"Error in memory evolution: {str(e)}")
+                logger.error("Error evolving neighbor %s: %s", target_id, e)
+                continue
+
+    def process_memory(self, note: MemoryNote) -> Tuple[bool, MemoryNote]:
+        """Process a memory note: link generation (Ps2) then per-neighbor evolution (Ps3).
+
+        Paper-aligned two-phase processing:
+        - Phase 1 (Eq.6): Link generation -- determine which neighbors should be linked
+        - Phase 2 (Eq.7): Memory evolution -- update each neighbor individually
+
+        Args:
+            note: The memory note to process
+
+        Returns:
+            Tuple[bool, MemoryNote]: (did_evolve, processed_note)
+        """
+        if not self.memories:
+            return False, note
+
+        try:
+            neighbors_text, indices, neighbor_ids = self.find_related_memories(
+                note.content, k=self.evolution_k
+            )
+            if not neighbors_text or not neighbor_ids:
                 return False, note
-                
+
+            # Phase 1: Link Generation (Ps2, Eq.6)
+            evolved = self._generate_links(note, neighbors_text, neighbor_ids)
+
+            # Phase 2: Memory Evolution (Ps3, Eq.7) -- per-neighbor
+            self._evolve_neighbors(note, neighbor_ids)
+
+            return evolved, note
+
         except Exception as e:
-            # For testing purposes, catch all exceptions and return the original note
-            logger.error(f"Error in process_memory: {str(e)}")
+            logger.error("Error in process_memory: %s", e)
             return False, note
