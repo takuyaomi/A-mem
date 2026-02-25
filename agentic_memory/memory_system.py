@@ -285,11 +285,11 @@ Return JSON:
             except Exception as e:
                 logger.warning("analyze_content failed, proceeding without enrichment: %s", e)
 
-        # Update retriever with all documents
+        # Process memory for link generation and evolution
         evo_label, note = self.process_memory(note)
         self.memories[note.id] = note
-        
-        # Add to ChromaDB with complete metadata
+
+        # Add to ChromaDB with enriched document for embedding (paper Eq.3)
         metadata = {
             "id": note.id,
             "content": note.content,
@@ -303,7 +303,8 @@ Return JSON:
             "category": note.category,
             "tags": note.tags
         }
-        self.retriever.add_document(note.content, metadata, note.id)
+        enriched_doc = self._build_enriched_document(note)
+        self.retriever.add_document(enriched_doc, metadata, note.id)
         
         if evo_label == True:
             self.evo_cnt += 1
@@ -312,11 +313,9 @@ Return JSON:
         return note.id
     
     def consolidate_memories(self):
-        """Consolidate memories: update retriever with new documents"""
-        # Reset ChromaDB collection
-        self.retriever = ChromaRetriever(collection_name="memories",model_name=self.model_name)
-        
-        # Re-add all memory documents with their complete metadata
+        """Consolidate memories: rebuild ChromaDB collection from in-memory state."""
+        self.retriever = ChromaRetriever(collection_name="memories", model_name=self.model_name)
+
         for memory in self.memories.values():
             metadata = {
                 "id": memory.id,
@@ -331,7 +330,8 @@ Return JSON:
                 "category": memory.category,
                 "tags": memory.tags
             }
-            self.retriever.add_document(memory.content, metadata, memory.id)
+            enriched_doc = self._build_enriched_document(memory)
+            self.retriever.add_document(enriched_doc, metadata, memory.id)
     
     def find_related_memories(self, query: str, k: int = 5) -> Tuple[str, List[int], List[str]]:
         """Find related memories using ChromaDB retrieval.
@@ -449,9 +449,10 @@ Return JSON:
             "tags": note.tags
         }
         
-        # Delete and re-add to update
+        # Delete and re-add to update (using enriched document for embedding)
         self.retriever.delete_document(memory_id)
-        self.retriever.add_document(document=note.content, metadata=metadata, doc_id=memory_id)
+        enriched_doc = self._build_enriched_document(note)
+        self.retriever.add_document(document=enriched_doc, metadata=metadata, doc_id=memory_id)
         
         return True
     
@@ -665,7 +666,8 @@ Return JSON:
                             "tags": note.tags,
                         }
                         self.retriever.delete_document(mem_id)
-                        self.retriever.add_document(note.content, updated_metadata, mem_id)
+                        enriched_doc = self._build_enriched_document(note)
+                        self.retriever.add_document(enriched_doc, updated_metadata, mem_id)
                     except Exception as e:
                         logger.warning("Failed to update retrieval_count in ChromaDB for %s: %s", mem_id, e)
 
@@ -722,8 +724,28 @@ Return JSON:
                 )
         return text or "(none)"
 
+    @staticmethod
+    def _build_enriched_document(note: MemoryNote) -> str:
+        """Build an enriched document string for embedding (paper Eq.3).
+
+        Concatenates content, keywords, context, and tags so the embedding
+        vector captures all semantic facets of the memory, not just content.
+        """
+        parts = [note.content]
+        if note.keywords:
+            parts.append(" ".join(note.keywords))
+        if note.context and note.context != "General":
+            parts.append(note.context)
+        if note.tags:
+            parts.append(" ".join(note.tags))
+        return " | ".join(parts)
+
     def _persist_memory_to_chroma(self, note: MemoryNote):
-        """Persist the current state of a memory note to ChromaDB."""
+        """Persist the current state of a memory note to ChromaDB.
+
+        Uses delete-then-add pattern. If delete fails for a non-existence
+        reason, the error is logged but we still attempt the add.
+        """
         metadata = {
             "id": note.id,
             "content": note.content,
@@ -739,9 +761,13 @@ Return JSON:
         }
         try:
             self.retriever.delete_document(note.id)
-        except Exception:
+        except ValueError:
+            # Document does not exist yet -- expected on first persist
             pass
-        self.retriever.add_document(note.content, metadata, note.id)
+        except Exception as e:
+            logger.warning("Failed to delete document %s before re-add: %s", note.id, e)
+        enriched_doc = self._build_enriched_document(note)
+        self.retriever.add_document(enriched_doc, metadata, note.id)
 
     def _generate_links(self, note: MemoryNote, neighbors_text: str, neighbor_ids: List[str]) -> bool:
         """Phase 1 (Ps2): Link generation between new memory and its neighbors.
@@ -788,7 +814,6 @@ Return JSON:
                 return False
 
             connections = response_json.get("connections", [])
-            notes_id_list = list(self.memories.keys())
             indices = list(range(len(neighbor_ids)))
 
             resolved = []
@@ -818,23 +843,29 @@ Return JSON:
             )
             return True
 
-        except (json.JSONDecodeError, KeyError, Exception) as e:
-            logger.error("Error in link generation: %s", e)
+        except json.JSONDecodeError as e:
+            logger.error("Malformed JSON from LLM in link generation: %s", e)
+            return False
+        except KeyError as e:
+            logger.error("Missing key in link generation response: %s", e)
             return False
 
-    def _evolve_neighbors(self, note: MemoryNote, neighbor_ids: List[str]):
+    def _evolve_neighbors(self, note: MemoryNote, neighbor_ids: List[str]) -> bool:
         """Phase 2 (Ps3): Per-neighbor memory evolution.
 
         For each neighbor, individually query the LLM to decide whether
         the neighbor should be updated given the new memory.
         Paper: Eq.7 -- each m_j is evaluated separately.
+
+        Returns True if at least one neighbor was evolved.
         """
+        any_evolved = False
+
         for target_id in neighbor_ids:
             target = self.memories.get(target_id)
             if not target:
                 continue
 
-            # Other neighbors (excluding target) as context
             other_ids = [nid for nid in neighbor_ids if nid != target_id]
             other_text = self._format_neighbors_for_prompt(other_ids)
 
@@ -886,16 +917,21 @@ Return JSON:
                         "trigger": note.id,
                         "action": "evolution",
                     })
-                    self.memories[target_id] = target
                     self._persist_memory_to_chroma(target)
+                    any_evolved = True
                     logger.info(
                         "Evolution: neighbor %s evolved (trigger=%s)",
                         target_id, note.id,
                     )
 
-            except (json.JSONDecodeError, KeyError, Exception) as e:
-                logger.error("Error evolving neighbor %s: %s", target_id, e)
+            except json.JSONDecodeError as e:
+                logger.error("Malformed JSON from LLM for neighbor %s: %s", target_id, e)
                 continue
+            except KeyError as e:
+                logger.error("Missing key in evolution response for neighbor %s: %s", target_id, e)
+                continue
+
+        return any_evolved
 
     def process_memory(self, note: MemoryNote) -> Tuple[bool, MemoryNote]:
         """Process a memory note: link generation (Ps2) then per-neighbor evolution (Ps3).
@@ -921,12 +957,12 @@ Return JSON:
                 return False, note
 
             # Phase 1: Link Generation (Ps2, Eq.6)
-            evolved = self._generate_links(note, neighbors_text, neighbor_ids)
+            linked = self._generate_links(note, neighbors_text, neighbor_ids)
 
             # Phase 2: Memory Evolution (Ps3, Eq.7) -- per-neighbor
-            self._evolve_neighbors(note, neighbor_ids)
+            evolved = self._evolve_neighbors(note, neighbor_ids)
 
-            return evolved, note
+            return (linked or evolved), note
 
         except Exception as e:
             logger.error("Error in process_memory: %s", e)
