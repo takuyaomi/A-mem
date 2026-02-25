@@ -32,7 +32,7 @@ class OpenAIController(BaseLLMController):
             ],
             response_format=response_format,
             temperature=temperature,
-            max_completion_tokens=1000
+            max_completion_tokens=4096
         )
         return response.choices[0].message.content
 
