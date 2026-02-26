@@ -193,7 +193,10 @@ class PersistentChromaRetriever(ChromaRetriever):
         
         if collection_name in existing_collections:
             if extend:
-                self.collection = self.client.get_collection(name=collection_name)
+                self.collection = self.client.get_collection(
+                    name=collection_name,
+                    embedding_function=self.embedding_function,
+                )
             else:
                 raise ValueError(
                     f"Collection '{collection_name}' already exists. "
