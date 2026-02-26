@@ -246,9 +246,9 @@ Content for analysis:
                                 }
                             },
                             "required": ["keywords", "context", "tags"],
-                            "additionalProperties": false
+                            "additionalProperties": False
                         },
-                        "strict": true
+                        "strict": True
                     }})
             result = json.loads(response)
             # Enforce caps even if LLM ignores maxItems
