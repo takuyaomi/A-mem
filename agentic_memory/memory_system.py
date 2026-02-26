@@ -175,9 +175,16 @@ Memory to evaluate for evolution:
   keywords: {target_keywords}
   tags: {target_tags}
 
-Should this memory's metadata be updated to reflect
-the relationship with the new memory? Only evolve if there is
-a meaningful semantic connection that warrants updating the metadata.
+Rules:
+- Set should_evolve=false if the new memory and target memory have no direct
+  semantic relationship (e.g., personal info vs. unrelated technical topic).
+- CRITICAL: Keep metadata focused on the TARGET memory's original content.
+  Do NOT import unrelated concepts from the new memory.
+- new_keywords: Max 7. Must all be relevant to the target memory's content.
+  Keep the target's existing core keywords; only add/replace if directly relevant.
+- new_context: Max 2 sentences, max 100 characters. Refine the target's context
+  to reflect the new relationship, but keep it about the target's topic.
+- new_tags: Max 5. Prune irrelevant tags. Each tag should classify the target memory.
 
 Return JSON:
 {{
@@ -205,34 +212,17 @@ Return JSON:
                 - context: str
                 - tags: List[str]
         """
-        prompt = """Generate a structured analysis of the following content by:
-            1. Identifying the most salient keywords (focus on nouns, verbs, and key concepts)
-            2. Extracting core themes and contextual elements
-            3. Creating relevant categorical tags
+        prompt = """Analyze the following content and extract structured metadata.
+Follow the Zettelkasten principle: each note is an atomic, self-contained unit.
 
-            Format the response as a JSON object:
-            {
-                "keywords": [
-                    // several specific, distinct keywords that capture key concepts and terminology
-                    // Order from most to least important
-                    // Don't include keywords that are the name of the speaker or time
-                    // At least three keywords, but don't be too redundant.
-                ],
-                "context": 
-                    // one sentence summarizing:
-                    // - Main topic/domain
-                    // - Key arguments/points
-                    // - Intended audience/purpose
-                ,
-                "tags": [
-                    // several broad categories/themes for classification
-                    // Include domain, format, and type tags
-                    // At least three tags, but don't be too redundant.
-                ]
-            }
+Rules:
+- keywords: Extract 3 to 5 keywords that appear in or directly relate to the content.
+  Only core concepts. Order from most to least important. No meta-descriptions.
+- context: Exactly one sentence (max 80 characters) summarizing the main topic.
+- tags: 2 to 3 broad category labels for classification. No overlapping or redundant tags.
 
-            Content for analysis:
-            """ + content
+Content for analysis:
+""" + content
         try:
             response = self.llm_controller.llm.get_completion(prompt, response_format={"type": "json_schema", "json_schema": {
                         "name": "response",
@@ -246,7 +236,7 @@ Return JSON:
                                     }
                                 },
                                 "context": {
-                                    "type": "string",
+                                    "type": "string"
                                 },
                                 "tags": {
                                     "type": "array",
@@ -254,10 +244,21 @@ Return JSON:
                                         "type": "string"
                                     }
                                 }
-                            }
-                        }
+                            },
+                            "required": ["keywords", "context", "tags"],
+                            "additionalProperties": false
+                        },
+                        "strict": true
                     }})
-            return json.loads(response)
+            result = json.loads(response)
+            # Enforce caps even if LLM ignores maxItems
+            if "keywords" in result:
+                result["keywords"] = result["keywords"][:5]
+            if "tags" in result:
+                result["tags"] = result["tags"][:3]
+            if "context" in result and len(result["context"]) > 120:
+                result["context"] = result["context"][:120]
+            return result
         except Exception as e:
             print(f"Error analyzing content: {e}")
             return {"keywords": [], "context": "General", "tags": []}
@@ -909,9 +910,12 @@ Return JSON:
                 response_json = json.loads(response)
 
                 if response_json.get("should_evolve", False):
-                    target.context = response_json["new_context"]
-                    target.tags = response_json["new_tags"]
-                    target.keywords = response_json.get("new_keywords", target.keywords)
+                    # Apply with caps to prevent metadata bloat
+                    new_ctx = response_json["new_context"]
+                    target.context = new_ctx[:150] if len(new_ctx) > 150 else new_ctx
+                    target.tags = response_json["new_tags"][:5]
+                    new_kw = response_json.get("new_keywords", target.keywords)
+                    target.keywords = new_kw[:7]
                     target.evolution_history.append({
                         "timestamp": datetime.now().strftime("%Y%m%d%H%M"),
                         "trigger": note.id,
