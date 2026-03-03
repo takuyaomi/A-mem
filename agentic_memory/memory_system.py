@@ -1,4 +1,3 @@
-import keyword
 from typing import List, Dict, Optional, Any, Tuple
 import uuid
 from datetime import datetime
@@ -6,18 +5,6 @@ from .llm_controller import LLMController
 from .retrievers import ChromaRetriever
 import json
 import logging
-from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-import os
-from abc import ABC, abstractmethod
-from transformers import AutoModel, AutoTokenizer
-from nltk.tokenize import word_tokenize
-import pickle
-from pathlib import Path
-from litellm import completion
-import time
 
 logger = logging.getLogger(__name__)
 
@@ -474,23 +461,6 @@ Content for analysis:
             return True
         return False
     
-    def _search_raw(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """Internal search method that returns raw results from ChromaDB.
-        
-        This is used internally by the memory evolution system to find
-        related memories for potential evolution.
-        
-        Args:
-            query (str): The search query text
-            k (int): Maximum number of results to return
-            
-        Returns:
-            List[Dict[str, Any]]: Raw search results from ChromaDB
-        """
-        results = self.retriever.search(query, k)
-        return [{'id': doc_id, 'score': score} 
-                for doc_id, score in zip(results['ids'][0], results['distances'][0])]
-                
     def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         """Search for memories using a hybrid retrieval approach."""
         # Get results from ChromaDB (only do this once)
@@ -511,63 +481,6 @@ Content for analysis:
         
         return memories[:k]
     
-    def _search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for memories using a hybrid retrieval approach.
-        
-        This method combines results from both:
-        1. ChromaDB vector store (semantic similarity)
-        2. Embedding-based retrieval (dense vectors)
-        
-        The results are deduplicated and ranked by relevance.
-        
-        Args:
-            query (str): The search query text
-            k (int): Maximum number of results to return
-            
-        Returns:
-            List[Dict[str, Any]]: List of search results, each containing:
-                - id: Memory ID
-                - content: Memory content
-                - score: Similarity score
-                - metadata: Additional memory metadata
-        """
-        # Get results from ChromaDB
-        chroma_results = self.retriever.search(query, k)
-        memories = []
-        
-        # Process ChromaDB results
-        for i, doc_id in enumerate(chroma_results['ids'][0]):
-            memory = self.memories.get(doc_id)
-            if memory:
-                memories.append({
-                    'id': doc_id,
-                    'content': memory.content,
-                    'context': memory.context,
-                    'keywords': memory.keywords,
-                    'score': chroma_results['distances'][0][i]
-                })
-                
-        # Get results from embedding retriever
-        embedding_results = self.retriever.search(query, k)
-        
-        # Combine results with deduplication
-        seen_ids = set(m['id'] for m in memories)
-        for result in embedding_results:
-            memory_id = result.get('id')
-            if memory_id and memory_id not in seen_ids:
-                memory = self.memories.get(memory_id)
-                if memory:
-                    memories.append({
-                        'id': memory_id,
-                        'content': memory.content,
-                        'context': memory.context,
-                        'keywords': memory.keywords,
-                        'score': result.get('score', 0.0)
-                    })
-                    seen_ids.add(memory_id)
-                    
-        return memories[:k]
-
     def search_agentic(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         """Search for memories using ChromaDB retrieval."""
         if not self.memories:

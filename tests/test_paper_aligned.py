@@ -293,11 +293,13 @@ class TestBidirectionalLinks(unittest.TestCase):
 
         id2 = system.add_note("Topic X advanced")
 
-        # Verify ChromaDB has the updated reverse link for id1
-        results = system.retriever.search("Topic X details", k=1)
-        self.assertTrue(len(results['ids'][0]) > 0)
-        chroma_meta = results['metadatas'][0][0]
+        # Verify ChromaDB has the updated reverse link for id1 via direct ID lookup
+        results = system.retriever.collection.get(ids=[id1], include=["metadatas"])
+        self.assertTrue(len(results['ids']) > 0, f"id1 should exist in ChromaDB")
+        chroma_meta = results['metadatas'][0]
         chroma_links = chroma_meta.get('links', [])
+        if isinstance(chroma_links, str):
+            chroma_links = json.loads(chroma_links)
         self.assertIn(
             id2, chroma_links,
             f"ChromaDB metadata for {id1} should contain reverse link to {id2}"
@@ -502,13 +504,20 @@ class TestEvolutionPersistence(unittest.TestCase):
 
         id2 = system.add_note("Trigger content for persistence test")
 
-        # Verify directly from ChromaDB
-        results = system.retriever.search("Persist test content", k=1)
-        self.assertTrue(len(results['ids'][0]) > 0)
-        meta = results['metadatas'][0][0]
+        # Verify directly from ChromaDB via ID lookup (not semantic search)
+        results = system.retriever.collection.get(ids=[id1], include=["metadatas"])
+        self.assertTrue(len(results['ids']) > 0, f"id1 should exist in ChromaDB")
+        meta = results['metadatas'][0]
         self.assertEqual(meta.get('context'), "Persisted evolved context")
-        self.assertEqual(meta.get('tags'), ["persisted_tag"])
-        self.assertEqual(meta.get('keywords'), ["persisted_keyword"])
+        # tags/keywords may be stored as JSON strings
+        tags = meta.get('tags', [])
+        if isinstance(tags, str):
+            tags = json.loads(tags)
+        keywords = meta.get('keywords', [])
+        if isinstance(keywords, str):
+            keywords = json.loads(keywords)
+        self.assertEqual(tags, ["persisted_tag"])
+        self.assertEqual(keywords, ["persisted_keyword"])
 
     def test_consolidation_preserves_evolved_data(self):
         """After consolidation, evolved metadata should still be intact."""
